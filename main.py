@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 import re
 import requests
@@ -51,6 +52,8 @@ class EmailState(TypedDict):
     calendar_service: Any
     user_tz_str: str
     user_tzinfo: timezone
+    counters: dict
+    log_seq: int
 
 
 # ============================================================
@@ -106,6 +109,72 @@ def get_user_timezone(calendar_service) -> tuple[str, ZoneInfo]:
         tzinfo = ZoneInfo(tz_str)
 
     return tz_str, tzinfo
+
+def _log(node: str, event: str, state: EmailState, level: str = "info", **details):
+    """Emit a structured JSON log with counters and a message id.
+
+    Increments counters for events: processed, booked, suggested, drafted.
+    Adds ISO-8601 timestamp and flattens nested 'details' if provided.
+    """
+    seq = int(state.get("log_seq", 0)) + 1
+    state["log_seq"] = seq
+    counters = state.get("counters") or {"processed": 0, "booked": 0, "suggested": 0, "drafted": 0}
+    if event in counters:
+        counters[event] = int(counters.get(event, 0)) + 1
+    state["counters"] = counters
+
+    # Flatten nested 'details' argument if present
+    merged_details = {}
+    if "details" in details and isinstance(details.get("details"), dict):
+        merged_details.update(details.pop("details"))
+    # Exclude reserved top-level keys
+    reserved = {"msg_id", "node", "level", "event", "counters", "timestamp"}
+    for k, v in list(details.items()):
+        if k not in reserved:
+            merged_details[k] = v
+
+    tzinfo = state.get("user_tzinfo") or timezone.utc
+    payload = {
+        "timestamp": datetime.now(tzinfo).isoformat(),
+        "msg_id": f"{node}-{seq}",
+        "node": node,
+        "level": level,
+        "event": event,
+        "counters": counters,
+        "details": merged_details,
+    }
+    try:
+        print(json.dumps(payload, default=str))
+    except Exception:
+        print(payload)
+
+# Simple structured logger for main-level messages (no state/counters)
+_MAIN_LOG_SEQ = 0
+def _log_main(event: str, level: str = "info", **details):
+    """Main-level logger with timestamp and flattened details."""
+    global _MAIN_LOG_SEQ
+    _MAIN_LOG_SEQ += 1
+
+    # Flatten nested 'details' if present
+    merged_details = {}
+    if "details" in details and isinstance(details.get("details"), dict):
+        merged_details.update(details.pop("details"))
+    for k, v in list(details.items()):
+        if k not in {"msg_id", "node", "level", "event", "counters", "timestamp"}:
+            merged_details[k] = v
+
+    payload = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "msg_id": f"main-{_MAIN_LOG_SEQ}",
+        "node": "main",
+        "level": level,
+        "event": event,
+        "details": merged_details,
+    }
+    try:
+        print(json.dumps(payload, default=str))
+    except Exception:
+        print(payload)
 
 
 # ============================================================
@@ -583,7 +652,10 @@ def generate_alternative_times_email(original_email, requested_time, alternative
     return response.content.strip()
 
 def check_calendar_availability(calendar_service, start_time, duration_minutes=60, attendee_email=None, meeting_title="Meeting", original_email=None, time_zone: str | None = None, default_tz: timezone | None = None):
-    """Check if a time slot is free and book it if available"""
+    """Check if a time slot is free and book it if available.
+
+    Returns tuple: (reply_text: str, status: str) where status in {"booked","suggested","error"}
+    """
     end_time = start_time + timedelta(minutes=duration_minutes)
 
     # Convert to RFC3339 string with local timezone
@@ -604,11 +676,11 @@ def check_calendar_availability(calendar_service, start_time, duration_minutes=6
         if original_email:
             alternative_slots = find_next_available_slots(calendar_service, start_time, duration_minutes, default_tz=default_tz)
             if alternative_slots:
-                return generate_alternative_times_email(original_email, start_time, alternative_slots, meeting_title)
+                return generate_alternative_times_email(original_email, start_time, alternative_slots, meeting_title), "suggested"
             else:
-                return "That time seems to be booked in my calendar. I couldn't find alternative slots in the next week, but I will get back to you with other options asap."
+                return "That time seems to be booked in my calendar. I couldn't find alternative slots in the next week, but I will get back to you with other options asap.", "suggested"
         else:
-            return "That time seems to be booked in my calendar, but I will get back to you with confirmation asap."
+            return "That time seems to be booked in my calendar, but I will get back to you with confirmation asap.", "suggested"
     else:
         # Time is available - create the event
         created_event = create_calendar_event(
@@ -622,12 +694,12 @@ def check_calendar_availability(calendar_service, start_time, duration_minutes=6
         
         if created_event and original_email:
             # Generate AI-powered confirmation email
-            return generate_calendar_confirmation_email(original_email, created_event, start_time, meeting_title)
+            return generate_calendar_confirmation_email(original_email, created_event, start_time, meeting_title), "booked"
         elif created_event:
             event_link = created_event.get('htmlLink', '')
-            return f"Perfect! I've booked that time in my calendar. Meeting scheduled for {start_time.strftime('%B %d, %Y at %I:%M %p')}. Calendar link: {event_link}"
+            return f"Perfect! I've booked that time in my calendar. Meeting scheduled for {start_time.strftime('%B %d, %Y at %I:%M %p')}. Calendar link: {event_link}", "booked"
         else:
-            return "That time is available, but I had trouble creating the calendar event. I'll get back to you with confirmation asap."
+            return "That time is available, but I had trouble creating the calendar event. I'll get back to you with confirmation asap.", "error"
 
 
 # ============================================================
@@ -647,7 +719,7 @@ def datetime_detection_node(state: EmailState) -> EmailState:
                 mark_email_as_processed(gmail_service, email['id'])
             state["action_taken"] = "ignored_no_reply"
         except Exception as e:
-            print(f"  - Warning: could not mark no-reply email as processed: {e}")
+            _log("datetime_detection", "error", state, level="error", details={"exception": str(e)})
         return state
     # Determine user timezone (fetch once and cache in state)
     tz_str = state.get("user_tz_str")
@@ -661,7 +733,7 @@ def datetime_detection_node(state: EmailState) -> EmailState:
     dt = extract_datetime_from_text(email['body'], tzinfo)
     
     if dt:
-        print(f"  - Detected datetime inquiry: {dt}")
+        _log("datetime_detection", "datetime_detected", state, details={"detected_time": dt.isoformat(), "from": email.get('from')})
         state["datetime_detected"] = dt
         
         # Extract attendee email from sender
@@ -674,7 +746,7 @@ def datetime_detection_node(state: EmailState) -> EmailState:
         calendar_service = state.get("calendar_service")
         gmail_service = state.get("gmail_service")
         
-        availability_reply = check_calendar_availability(
+        availability_reply, availability_status = check_calendar_availability(
             calendar_service,
             dt,
             duration_minutes=60,
@@ -687,18 +759,24 @@ def datetime_detection_node(state: EmailState) -> EmailState:
         
         try:
             send_reply(gmail_service, email['id'], availability_reply)
-            print("  - Reply sent and calendar updated successfully")
+            if availability_status == "booked":
+                _log("datetime_detection", "booked", state, details={"start_time": dt.isoformat(), "attendee": attendee_email, "title": meeting_title})
+                # Notify Slack only on actual booking
+                msg = (
+                    f"Booked: {meeting_title} on {dt.strftime('%B %d, %Y at %I:%M %p')} "
+                    f"for {email['from']}."
+                )
+                _notify_slack(msg)
+            elif availability_status == "suggested":
+                _log("datetime_detection", "suggested", state, details={"requested_time": dt.isoformat(), "attendee": attendee_email, "title": meeting_title})
+            else:
+                _log("datetime_detection", "error", state, level="error", details={"requested_time": dt.isoformat(), "attendee": attendee_email, "title": meeting_title})
             mark_email_as_processed(gmail_service, email['id'])
+            _log("datetime_detection", "processed", state, details={"email_id": email['id']})
             state["action_taken"] = "calendar_booking_completed"
             state["calendar_result"] = availability_reply
-            # Notify Slack
-            msg = (
-                f"Booked: {meeting_title} on {dt.strftime('%B %d, %Y at %I:%M %p')} "
-                f"for {email['from']}."
-            )
-            _notify_slack(msg)
         except Exception as e:
-            print(f"  - Error sending reply: {str(e)}")
+            _log("datetime_detection", "error", state, level="error", details={"exception": str(e)})
             state["action_taken"] = "calendar_booking_failed"
     
     return state
@@ -719,7 +797,7 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
         return state
     
     if is_meeting_confirmation_reply(email['body']):
-        print(f"  - Detected meeting confirmation reply")
+        _log("meeting_confirmation", "confirmation_detected", state, details={"from": email.get('from'), "subject": email.get('subject')})
         
         # Extract attendee email from sender
         _, attendee_email = parseaddr(email['from'])
@@ -762,8 +840,12 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
             
             try:
                 send_reply(gmail_service, email['id'], confirmation_reply)
-                print("  - Meeting confirmed and calendar event created")
+                if created_event:
+                    _log("meeting_confirmation", "booked", state, details={"start_time": confirmed_time.isoformat(), "attendee": attendee_email, "title": meeting_title})
+                else:
+                    _log("meeting_confirmation", "error", state, level="error", details={"start_time": confirmed_time.isoformat(), "attendee": attendee_email, "title": meeting_title})
                 mark_email_as_processed(gmail_service, email['id'])
+                _log("meeting_confirmation", "processed", state, details={"email_id": email['id']})
                 state["action_taken"] = "meeting_confirmed"
                 state["meeting_confirmed"] = True
                 state["calendar_result"] = confirmation_reply
@@ -774,7 +856,7 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
                 )
                 _notify_slack(msg)
             except Exception as e:
-                print(f"  - Error sending confirmation reply: {str(e)}")
+                _log("meeting_confirmation", "error", state, level="error", details={"exception": str(e)})
                 state["action_taken"] = "meeting_confirmation_failed"
     
     return state
@@ -825,9 +907,10 @@ def urgency_analysis_node(state: EmailState) -> EmailState:
         try:
             if gmail_service:
                 mark_email_as_processed(gmail_service, email['id'])
+            _log("urgency_analysis", "processed", state, details={"email_id": email['id']})
             state["action_taken"] = "not_urgent_processed"
         except Exception as e:
-            print(f"  - Warning: could not mark non-urgent email as processed: {e}")
+            _log("urgency_analysis", "error", state, level="error", details={"exception": str(e)})
     
     return state
 
@@ -837,7 +920,7 @@ def draft_creation_node(state: EmailState) -> EmailState:
     urgency_result = state.get("urgency_result", "")
     
     if urgency_result.startswith("urgent"):
-        print("  - Urgent email detected")
+        _log("draft_creation", "urgent_detected", state, details={"from": email.get('from'), "subject": email.get('subject')})
         
         draft_prompt = f"""Write a professional draft response for this urgent email:
 
@@ -863,18 +946,19 @@ def draft_creation_node(state: EmailState) -> EmailState:
         
         try:
             create_draft(gmail_service, email['id'], draft_content)
-            print("  - Draft created successfully")
+            _log("draft_creation", "drafted", state, details={"email_id": email['id']})
             mark_email_as_processed(gmail_service, email['id'])
+            _log("draft_creation", "processed", state, details={"email_id": email['id']})
             state["action_taken"] = "draft_created"
             state["draft_content"] = draft_content
             # Notify Slack
             subject = email.get('subject', 'No Subject')
             _notify_slack(f"Draft created for: {subject} from {email['from']}.")
         except Exception as e:
-            print(f"  - Error creating draft: {str(e)}")
+            _log("draft_creation", "error", state, level="error", details={"exception": str(e)})
             state["action_taken"] = "draft_creation_failed"
     else:
-        print("  - Not urgent, skipping")
+        _log("draft_creation", "skipped", state, details={"reason": "not_urgent"})
         # Get services to mark as processed
         gmail_service = state.get("gmail_service")
         mark_email_as_processed(gmail_service, email['id'])
@@ -968,10 +1052,10 @@ if __name__ == "__main__":
     user_tz_str, user_tzinfo = get_user_timezone(calendar_service)
     
     emails = get_emails(gmail_service)
-    print(f"Found {len(emails)} emails to process")
+    _log_main("start", count=len(emails))
 
     for email in emails:
-        print(f"\nProcessing email: {email['subject']}")
+        _log_main("processing_email", subject=email.get('subject'), id=email.get('id'))
         
         # Initialize state
         initial_state = {
@@ -988,13 +1072,14 @@ if __name__ == "__main__":
             "calendar_service": calendar_service,
             "user_tz_str": user_tz_str,
             "user_tzinfo": user_tzinfo,
+            "counters": {"processed": 0, "booked": 0, "suggested": 0, "drafted": 0},
+            "log_seq": 0,
         }
         
         # Run the workflow
         try:
             final_state = app.invoke(initial_state)
-            print(f"  - Final action: {final_state.get('action_taken', 'none')}")
+            _log_main("final_action", action=final_state.get('action_taken', 'none'), email_id=email.get('id'))
         except Exception as e:
-            print(f"  - Error processing email: {str(e)}")
-
-    print("\nProcessing complete. Check your Gmail inbox + drafts + label: 'ai-processed'.")
+            _log_main("error", level="error", error=str(e), email_id=email.get('id'))
+    _log_main("done")
