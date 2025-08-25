@@ -23,6 +23,7 @@ from main import (
     _log,
     _log_main,
     _notify_slack,
+    retrieve_policy_context,
 )
 
 # Separate models per agent (can be tuned independently)
@@ -174,7 +175,7 @@ def confirmation_agent_node(state: EmailState) -> EmailState:
         duration_minutes=60,
         attendee_email=attendee_email,
         meeting_title=meeting_title,
-        original_email=None,
+        original_email=email,
         time_zone=tz_str,
         default_tz=tzinfo,
     )
@@ -247,8 +248,31 @@ def drafting_agent_node(state: EmailState) -> EmailState:
         return state
 
     from langchain_core.messages import SystemMessage, HumanMessage
-    system = SystemMessage(content="You are a helpful assistant that writes short, professional email replies (body only). Keep under 3 sentences.")
-    prompt = f"""Write a professional draft response for this urgent email:\n\nOriginal email content:\n{email['body']}\n\nGuidelines:\n- Acknowledge receipt and show empathy\n- Keep response under 3 sentences\n- Offer immediate next steps if needed\n- Keep it short, professional, and helpful\n"""
+    # Retrieve policy context using the same helper as single-agent flow
+    query = f"Urgent reply policy for subject: {email.get('subject', '')}. Body: {email.get('body', '')[:800]}"
+    try:
+        top_policies = retrieve_policy_context(query)
+    except Exception as e:
+        top_policies = []
+        _log("draft_agent", "retrieval_error", state, level="warning", exception=str(e))
+    policy_context = "\n\n".join(top_policies) if top_policies else "(No policy context retrieved; follow brevity, professional tone, no sensitive info.)"
+
+    system = SystemMessage(content="You are an executive communications specialist who crafts executive-level communications (body only)")
+    prompt = f"""Write a professional, policy-compliant draft response for this urgent email.
+
+        POLICY CONTEXT (follow strictly):
+        {policy_context}
+
+        ORIGINAL EMAIL CONTENT:
+        {email['body']}
+
+        Guidelines:
+        - Acknowledge receipt and show empathy
+        - Keep response under 3 sentences
+        - Offer immediate next steps if needed
+        - Maintain professional tone
+        - Do not include sensitive information or commitments you cannot verify
+        - If scheduling is referenced, propose clear next steps without overcommitting"""
     human = HumanMessage(content=prompt)
 
     try:
@@ -257,6 +281,8 @@ def drafting_agent_node(state: EmailState) -> EmailState:
         gmail_service = state.get("gmail_service")
         create_draft(gmail_service, email['id'], draft_content)
         _log("draft_agent", "drafted", state, email_id=email['id'])
+        if top_policies:
+            _log("draft_agent", "policy_used", state, snippets=min(3, len(top_policies)))
         state["action_taken"] = "draft_created"
         state["draft_content"] = draft_content
         _notify_slack(f"Draft created for: {email.get('subject', 'No Subject')} from {email['from']}.")

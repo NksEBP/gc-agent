@@ -15,7 +15,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
@@ -583,10 +583,23 @@ def _notify_slack(text: str):
         pass
 
 def generate_calendar_confirmation_email(original_email, created_event, start_time, meeting_title):
-    """Generate professional calendar confirmation email using AI"""
+    """Generate professional calendar confirmation email using AI (policy-aware)."""
     event_link = created_event.get('htmlLink', '') if created_event else ''
-    
-    prompt = f"""Write a professional calendar confirmation email based on this meeting request:
+
+    # Retrieve policy context
+    try:
+        query = f"Calendar confirmation policy for subject: {original_email.get('subject','')}. Body: {original_email.get('body','')[:800]}"
+        top_policies = retrieve_policy_context(query)
+    except Exception as e:
+        top_policies = []
+        # Best-effort: no state object here; keep silent to avoid side-effects
+
+    policy_context = "\n\n".join(top_policies) if top_policies else ""
+
+    prompt = f"""Write a professional calendar confirmation email based on this meeting request.
+
+        POLICY CONTEXT (follow strictly):
+        {policy_context}
 
         ORIGINAL EMAIL:
         FROM: {original_email['from']}
@@ -610,18 +623,30 @@ def generate_calendar_confirmation_email(original_email, created_event, start_ti
         SystemMessage(content="You are a calendar & meeting coordinator expert at scheduling and confirming meetings (body only)."),
         HumanMessage(content=prompt)
     ]
-    
+
     response = llm.invoke(messages)
     return response.content.strip()
 
 def generate_alternative_times_email(original_email, requested_time, alternative_slots, meeting_title):
-    """Generate email with alternative meeting time suggestions"""
+    """Generate email with alternative meeting time suggestions (policy-aware)."""
     alternatives_text = "\n".join([
         f"- {slot.strftime('%B %d, %Y at %I:%M %p')}" 
         for slot in alternative_slots
     ])
-    
-    prompt = f"""Write a professional email suggesting alternative meeting times:
+
+    # Retrieve policy context
+    try:
+        query = f"Alternative times policy for subject: {original_email.get('subject','')}. Body: {original_email.get('body','')[:800]}"
+        top_policies = retrieve_policy_context(query)
+    except Exception:
+        top_policies = []
+
+    policy_context = "\n\n".join(top_policies) if top_policies else ""
+
+    prompt = f"""Write a professional email suggesting alternative meeting times.
+
+        POLICY CONTEXT (follow strictly):
+        {policy_context}
 
         ORIGINAL EMAIL:
         FROM: {original_email['from']}
@@ -629,10 +654,7 @@ def generate_alternative_times_email(original_email, requested_time, alternative
         CONTENT: {original_email['body']}
 
         SITUATION:
-        Requested time: {requested_time.strftime('%B %d, %Y at %I:%M %p')} is not available
-        Meeting title: {meeting_title}
-
-        ALTERNATIVE TIME OPTIONS:
+        The requested time {requested_time.strftime('%B %d, %Y at %I:%M %p')} is not available. Here are some alternative time slots:
         {alternatives_text}
 
         Guidelines:
@@ -647,7 +669,7 @@ def generate_alternative_times_email(original_email, requested_time, alternative
         SystemMessage(content="You are a calendar & meeting coordinator expert at scheduling and confirming meetings (body only)."),
         HumanMessage(content=prompt)
     ]
-    
+
     response = llm.invoke(messages)
     return response.content.strip()
 
@@ -706,6 +728,97 @@ def check_calendar_availability(calendar_service, start_time, duration_minutes=6
 # LANGGRAPH NODES
 # ============================================================
 llm = ChatOpenAI(model=LLM_MODEL, temperature=0.3)
+
+# ============================================================
+# RAG HELPERS (Policy Retrieval)
+# ============================================================
+_POLICY_INDEX = None  # lazy-initialized global index {"chunks": [...], "embeddings": [[...], ...]}
+_EMBEDDINGS = None
+
+def _get_embeddings():
+    global _EMBEDDINGS
+    if _EMBEDDINGS is None:
+        # Use small, fast embedding model
+        _EMBEDDINGS = OpenAIEmbeddings(model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"))
+    return _EMBEDDINGS
+
+def _load_policy_texts(policy_dir: str) -> list[str]:
+    texts: list[str] = []
+    if not policy_dir or not os.path.isdir(policy_dir):
+        # Fallback minimal policy so drafting is still guided
+        texts.append(
+            """
+            Policy: Keep responses concise (<= 3 sentences). Maintain professional and empathetic tone.
+            Do not include sensitive information. For scheduling, propose clear next steps and avoid committing to specifics you cannot verify.
+            """.strip()
+        )
+        return texts
+    try:
+        for fname in os.listdir(policy_dir):
+            if not any(fname.lower().endswith(ext) for ext in (".md", ".txt")):
+                continue
+            fpath = os.path.join(policy_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    texts.append(f.read())
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not texts:
+        texts.append("Policies directory was empty or unreadable. Default to brevity, professionalism, and safety.")
+    return texts
+
+def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str]:
+    words = text.split()
+    chunks: list[str] = []
+    i = 0
+    while i < len(words):
+        chunk_words = words[i:i + chunk_size]
+        if not chunk_words:
+            break
+        chunks.append(" ".join(chunk_words))
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+def _build_policy_index() -> dict:
+    policy_dir = os.getenv("POLICY_DIR", "policies")
+    texts = _load_policy_texts(policy_dir)
+    chunks: list[str] = []
+    for t in texts:
+        chunks.extend(_chunk_text(t))
+    embs = _get_embeddings().embed_documents(chunks) if chunks else []
+    return {"chunks": chunks, "embeddings": embs}
+
+def _get_policy_index() -> dict:
+    global _POLICY_INDEX
+    if _POLICY_INDEX is None:
+        _POLICY_INDEX = _build_policy_index()
+    return _POLICY_INDEX
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    # Safe cosine without numpy
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+def retrieve_policy_context(query: str, k: int | None = None) -> list[str]:
+    idx = _get_policy_index()
+    chunks: list[str] = idx.get("chunks", [])
+    embs = idx.get("embeddings", [])
+    if not chunks or not embs:
+        return []
+    k = k or int(os.getenv("RAG_TOP_K", "3"))
+    q_emb = _get_embeddings().embed_query(query)
+    scores = [(i, _cosine(q_emb, e)) for i, e in enumerate(embs)]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = [chunks[i] for i, _ in scores[:max(1, k)]]
+    return top
 
 def datetime_detection_node(state: EmailState) -> EmailState:
     """Check if email contains datetime and handle calendar booking"""
@@ -921,17 +1034,30 @@ def draft_creation_node(state: EmailState) -> EmailState:
     
     if urgency_result.startswith("urgent"):
         _log("draft_creation", "urgent_detected", state, details={"from": email.get('from'), "subject": email.get('subject')})
+        # Build retrieval query and fetch policy context
+        query = f"Urgent reply policy for subject: {email.get('subject', '')}. Body: {email.get('body', '')[:800]}"
+        try:
+            top_policies = retrieve_policy_context(query)
+        except Exception as e:
+            top_policies = []
+            _log("draft_creation", "retrieval_error", state, level="warning", details={"exception": str(e)})
+        policy_context = "\n\n".join(top_policies) if top_policies else "(No policy context retrieved; follow brevity, professional tone, no sensitive info.)"
         
-        draft_prompt = f"""Write a professional draft response for this urgent email:
+        draft_prompt = f"""Write a professional, policy-compliant draft response for this urgent email.
 
-            Original email content:
+            POLICY CONTEXT (follow strictly):
+            {policy_context}
+
+            ORIGINAL EMAIL CONTENT:
             {email['body']}
 
             Guidelines:
             - Acknowledge receipt and show empathy
             - Keep response under 3 sentences
             - Offer immediate next steps if needed
-            - Maintain professional tone"""
+            - Maintain professional tone
+            - Do not include sensitive information or commitments you cannot verify
+            - If scheduling is referenced, propose clear next steps without overcommitting"""
 
         messages = [
             SystemMessage(content="You are an executive communications specialist who crafts executive-level communications (body only)"),
@@ -947,6 +1073,8 @@ def draft_creation_node(state: EmailState) -> EmailState:
         try:
             create_draft(gmail_service, email['id'], draft_content)
             _log("draft_creation", "drafted", state, details={"email_id": email['id']})
+            if top_policies:
+                _log("draft_creation", "policy_used", state, details={"snippets": min(3, len(top_policies))})
             mark_email_as_processed(gmail_service, email['id'])
             _log("draft_creation", "processed", state, details={"email_id": email['id']})
             state["action_taken"] = "draft_created"
@@ -1082,4 +1210,4 @@ if __name__ == "__main__":
             _log_main("final_action", action=final_state.get('action_taken', 'none'), email_id=email.get('id'))
         except Exception as e:
             _log_main("error", level="error", error=str(e), email_id=email.get('id'))
-    _log_main("done")
+    _log_main("Completed")
