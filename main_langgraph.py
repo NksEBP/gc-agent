@@ -5,6 +5,7 @@ import requests
 
 from typing import TypedDict, Annotated, Any
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dateutil import parser as date_parser
 from email.utils import parseaddr
 from google.auth.transport.requests import Request
@@ -48,6 +49,8 @@ class EmailState(TypedDict):
     processed: bool
     gmail_service: Any
     calendar_service: Any
+    user_tz_str: str
+    user_tzinfo: timezone
 
 
 # ============================================================
@@ -76,6 +79,33 @@ def get_gmail_service(creds):
 
 def get_calendar_service(creds):
     return build('calendar', 'v3', credentials=creds)
+
+def get_user_timezone(calendar_service) -> tuple[str, ZoneInfo]:
+    """Return user's primary Calendar timezone string and ZoneInfo.
+
+    Fallback order:
+      1) Google Calendar settings 'timezone'
+      2) USER_TZ env var (e.g., 'Australia/Sydney')
+      3) 'Asia/Kathmandu'
+    """
+    tz_str = None
+    try:
+        # Calendar settings API: settings.get(setting='timezone')
+        setting = calendar_service.settings().get(setting='timezone').execute()
+        tz_str = setting.get('value')
+    except Exception:
+        pass
+
+    if not tz_str:
+        tz_str = os.getenv('USER_TZ', 'Asia/Kathmandu')
+
+    try:
+        tzinfo = ZoneInfo(tz_str)
+    except Exception:
+        tz_str = 'Asia/Kathmandu'
+        tzinfo = ZoneInfo(tz_str)
+
+    return tz_str, tzinfo
 
 
 # ============================================================
@@ -242,12 +272,33 @@ def send_reply(service, email_id, reply_content):
 
 
 # ============================================================
-# CALENDAR HELPERS
+# CALENDAR & TIME HELPERS
 # ============================================================
 
-# Set your local timezone offset (example: Nepal +05:45)
-LOCAL_OFFSET = timedelta(hours=5, minutes=45)
-LOCAL_TZ = timezone(LOCAL_OFFSET)
+# Common timezone abbreviations (esp. AU) for dateutil parsing
+TZINFOS = {
+    # Australia
+    'AEST': timezone(timedelta(hours=10)),
+    'AEDT': timezone(timedelta(hours=11)),
+    'ACST': timezone(timedelta(hours=9, minutes=30)),
+    'ACDT': timezone(timedelta(hours=10, minutes=30)),
+    'AWST': timezone(timedelta(hours=8)),
+    # US (for completeness)
+    'PST': timezone(timedelta(hours=-8)),
+    'PDT': timezone(timedelta(hours=-7)),
+    'MST': timezone(timedelta(hours=-7)),
+    'MDT': timezone(timedelta(hours=-6)),
+    'CST': timezone(timedelta(hours=-6)),
+    'CDT': timezone(timedelta(hours=-5)),
+    'EST': timezone(timedelta(hours=-5)),
+    'EDT': timezone(timedelta(hours=-4)),
+    # Other commons
+    'NPT': timezone(timedelta(hours=5, minutes=45)),  # Nepal
+    'IST': timezone(timedelta(hours=5, minutes=30)),  # India
+    'BST': timezone(timedelta(hours=1)),              # British Summer Time
+    'GMT': timezone(timedelta(hours=0)),
+    'UTC': timezone(timedelta(hours=0)),
+}
 
 
 # ============================================================
@@ -267,16 +318,23 @@ def is_no_reply(from_header: str) -> bool:
     ]
     return any(p in local for p in patterns)
 
-def extract_datetime_from_text(text):
-    """Extract the first datetime from text, normalize AM/PM, ignore timezone"""
+def extract_datetime_from_text(text, default_tz: timezone):
+    """Extract the first datetime from text, normalize AM/PM.
+
+    - If parsed datetime has no tzinfo, localize to default_tz.
+    - If parsed datetime has tzinfo, convert to default_tz.
+    """
     try:
         # Normalize lowercase am/pm
         text = text.replace("am", "AM").replace("pm", "PM")
         
         # Use today's date with 00:00:00 as default to avoid inheriting current time
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        dt = date_parser.parse(text, fuzzy=True, default=today_start)
-        dt = dt.replace(tzinfo=LOCAL_TZ)  # make timezone-aware
+        today_start = datetime.now(default_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt = date_parser.parse(text, fuzzy=True, default=today_start, tzinfos=TZINFOS)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=default_tz)
+        else:
+            dt = dt.astimezone(default_tz)
         return dt
     except Exception:
         return None
@@ -308,7 +366,7 @@ def is_meeting_confirmation_reply(email_body):
     
     return False
 
-def extract_suggested_times_from_email_chain(email_body):
+def extract_suggested_times_from_email_chain(email_body, default_tz: timezone):
     """Extract previously suggested meeting times from email thread"""
     suggested_times = []
     
@@ -323,7 +381,7 @@ def extract_suggested_times_from_email_chain(email_body):
         for match in matches:
             try:
                 # Try to parse each found time
-                dt = extract_datetime_from_text(match)
+                dt = extract_datetime_from_text(match, default_tz)
                 if dt and dt not in suggested_times:
                     suggested_times.append(dt)
             except:
@@ -331,15 +389,15 @@ def extract_suggested_times_from_email_chain(email_body):
     
     return suggested_times
 
-def extract_confirmed_meeting_time(email_body):
+def extract_confirmed_meeting_time(email_body, default_tz: timezone):
     """Extract confirmed meeting time from reply, or return first suggested time"""
     # First try to extract specific time from the reply
-    dt = extract_datetime_from_text(email_body)
+    dt = extract_datetime_from_text(email_body, default_tz)
     if dt:
         return dt
     
     # Extract previously suggested times from the email chain
-    suggested_times = extract_suggested_times_from_email_chain(email_body)
+    suggested_times = extract_suggested_times_from_email_chain(email_body, default_tz)
     
     # If "anytime" or similar, return first suggested time or default
     anytime_keywords = ["anytime", "any time", "flexible", "whatever works"]
@@ -348,7 +406,7 @@ def extract_confirmed_meeting_time(email_body):
             return suggested_times[0]  # Return first suggested time
         else:
             # Fallback to next business hour
-            now = datetime.now(LOCAL_TZ)
+            now = datetime.now(default_tz)
             if now.hour >= 17:  # After 5 PM
                 next_day = now + timedelta(days=1)
                 return next_day.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -372,7 +430,7 @@ def extract_confirmed_meeting_time(email_body):
     return None
 
 
-def create_calendar_event(calendar_service, start_time, duration_minutes=60, title="Meeting", attendee_email=None):
+def create_calendar_event(calendar_service, start_time, duration_minutes=60, title="Meeting", attendee_email=None, time_zone: str | None = None):
     """Create a calendar event"""
     end_time = start_time + timedelta(minutes=duration_minutes)
     
@@ -380,11 +438,11 @@ def create_calendar_event(calendar_service, start_time, duration_minutes=60, tit
         'summary': title,
         'start': {
             'dateTime': start_time.isoformat(),
-            'timeZone': 'Asia/Kathmandu',
+            'timeZone': time_zone or 'UTC',
         },
         'end': {
             'dateTime': end_time.isoformat(),
-            'timeZone': 'Asia/Kathmandu',
+            'timeZone': time_zone or 'UTC',
         },
     }
     
@@ -401,7 +459,7 @@ def create_calendar_event(calendar_service, start_time, duration_minutes=60, tit
         print(f"Error creating calendar event: {e}")
         return None
 
-def find_next_available_slots(calendar_service, requested_time, duration_minutes=60, num_suggestions=3):
+def find_next_available_slots(calendar_service, requested_time, duration_minutes=60, num_suggestions=3, default_tz: timezone | None = None):
     """Find next available time slots after the requested time, avoiding conflicts"""
     available_slots = []
     current_time = requested_time
@@ -429,8 +487,8 @@ def find_next_available_slots(calendar_service, requested_time, duration_minutes
             for event in events:
                 if 'dateTime' in event['end']:
                     event_end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
-                    # Convert to local timezone
-                    event_end = event_end.astimezone(LOCAL_TZ)
+                    if default_tz is not None:
+                        event_end = event_end.astimezone(default_tz)
                     # Jump to 15 minutes after the event ends
                     current_time = event_end + timedelta(minutes=15)
                     break
@@ -524,7 +582,7 @@ def generate_alternative_times_email(original_email, requested_time, alternative
     response = llm.invoke(messages)
     return response.content.strip()
 
-def check_calendar_availability(calendar_service, start_time, duration_minutes=60, attendee_email=None, meeting_title="Meeting", original_email=None):
+def check_calendar_availability(calendar_service, start_time, duration_minutes=60, attendee_email=None, meeting_title="Meeting", original_email=None, time_zone: str | None = None, default_tz: timezone | None = None):
     """Check if a time slot is free and book it if available"""
     end_time = start_time + timedelta(minutes=duration_minutes)
 
@@ -544,7 +602,7 @@ def check_calendar_availability(calendar_service, start_time, duration_minutes=6
     if events:
         # Time is busy - find alternative slots and suggest them
         if original_email:
-            alternative_slots = find_next_available_slots(calendar_service, start_time, duration_minutes)
+            alternative_slots = find_next_available_slots(calendar_service, start_time, duration_minutes, default_tz=default_tz)
             if alternative_slots:
                 return generate_alternative_times_email(original_email, start_time, alternative_slots, meeting_title)
             else:
@@ -554,11 +612,12 @@ def check_calendar_availability(calendar_service, start_time, duration_minutes=6
     else:
         # Time is available - create the event
         created_event = create_calendar_event(
-            calendar_service, 
-            start_time, 
-            duration_minutes, 
-            meeting_title, 
-            attendee_email
+            calendar_service,
+            start_time,
+            duration_minutes,
+            meeting_title,
+            attendee_email,
+            time_zone=time_zone,
         )
         
         if created_event and original_email:
@@ -590,7 +649,16 @@ def datetime_detection_node(state: EmailState) -> EmailState:
         except Exception as e:
             print(f"  - Warning: could not mark no-reply email as processed: {e}")
         return state
-    dt = extract_datetime_from_text(email['body'])
+    # Determine user timezone (fetch once and cache in state)
+    tz_str = state.get("user_tz_str")
+    tzinfo = state.get("user_tzinfo")
+    if not tz_str or not tzinfo:
+        calendar_service = state.get("calendar_service")
+        tz_str, tzinfo = get_user_timezone(calendar_service)
+        state["user_tz_str"] = tz_str
+        state["user_tzinfo"] = tzinfo
+
+    dt = extract_datetime_from_text(email['body'], tzinfo)
     
     if dt:
         print(f"  - Detected datetime inquiry: {dt}")
@@ -607,12 +675,14 @@ def datetime_detection_node(state: EmailState) -> EmailState:
         gmail_service = state.get("gmail_service")
         
         availability_reply = check_calendar_availability(
-            calendar_service, 
-            dt, 
-            duration_minutes=60, 
-            attendee_email=attendee_email, 
+            calendar_service,
+            dt,
+            duration_minutes=60,
+            attendee_email=attendee_email,
             meeting_title=meeting_title,
-            original_email=email
+            original_email=email,
+            time_zone=tz_str,
+            default_tz=tzinfo,
         )
         
         try:
@@ -657,8 +727,17 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
         # Use email subject as meeting title, or default
         meeting_title = email['subject'] if email['subject'] != 'No Subject' else "Meeting"
         
+        # Determine user timezone (use cached or fetch)
+        tz_str = state.get("user_tz_str")
+        tzinfo = state.get("user_tzinfo")
+        if not tz_str or not tzinfo:
+            calendar_service = state.get("calendar_service")
+            tz_str, tzinfo = get_user_timezone(calendar_service)
+            state["user_tz_str"] = tz_str
+            state["user_tzinfo"] = tzinfo
+
         # Try to extract specific time from reply, or use first suggested time
-        confirmed_time = extract_confirmed_meeting_time(email['body'])
+        confirmed_time = extract_confirmed_meeting_time(email['body'], tzinfo)
         
         if confirmed_time:
             # Get services from state
@@ -671,7 +750,8 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
                 confirmed_time,
                 duration_minutes=60,
                 title=meeting_title,
-                attendee_email=attendee_email
+                attendee_email=attendee_email,
+                time_zone=tz_str,
             )
             
             if created_event:
@@ -884,6 +964,8 @@ if __name__ == "__main__":
     creds = get_credentials()
     gmail_service = get_gmail_service(creds)
     calendar_service = get_calendar_service(creds)
+    # Fetch user's calendar timezone once
+    user_tz_str, user_tzinfo = get_user_timezone(calendar_service)
     
     emails = get_emails(gmail_service)
     print(f"Found {len(emails)} emails to process")
@@ -903,7 +985,9 @@ if __name__ == "__main__":
             "messages": [],
             "processed": False,
             "gmail_service": gmail_service,
-            "calendar_service": calendar_service
+            "calendar_service": calendar_service,
+            "user_tz_str": user_tz_str,
+            "user_tzinfo": user_tzinfo,
         }
         
         # Run the workflow
