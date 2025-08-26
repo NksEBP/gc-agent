@@ -8,3 +8,5 @@ langgraph
 langchain-core
 python-dotenv
 requests
+pytest
+

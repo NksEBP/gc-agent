@@ -935,7 +935,29 @@ def meeting_confirmation_node(state: EmailState) -> EmailState:
             calendar_service = state.get("calendar_service")
             gmail_service = state.get("gmail_service")
             
-            # Create the confirmed meeting
+            # Check for scheduling conflicts
+            end_time = confirmed_time + timedelta(minutes=60)
+            events_result = calendar_service.events().list(
+                calendarId='primary',
+                timeMin=confirmed_time.isoformat(),
+                timeMax=end_time.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            
+            conflicting_events = events_result.get('items', [])
+            
+            if conflicting_events:
+                # Store conflicting events in state for reference
+                state["calendar_events"] = conflicting_events
+                state["action_taken"] = "conflict_detected"
+                state["meeting_confirmed"] = False
+                _log("meeting_confirmation", "conflict_detected", state, 
+                     details={"requested_time": confirmed_time.isoformat(), 
+                             "conflicts": [e.get('summary') for e in conflicting_events]})
+                return state
+            
+            # No conflicts, create the meeting
             created_event = create_calendar_event(
                 calendar_service,
                 confirmed_time,
