@@ -395,16 +395,6 @@ pip install -r requirements.txt
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 ```
 
-#### Timezone Issues
-
-```bash
-# Check system timezone
-date
-
-# Set timezone in .env
-USER_TZ=America/New_York  # Replace with your timezone
-```
-
 ### Logs and Debugging
 
 - Check console output for JSON-formatted logs
