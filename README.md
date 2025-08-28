@@ -11,11 +11,12 @@ An automated assistant that triages Gmail messages and coordinates meetings via 
 ## Features
 
 - **Gmail triage**: Reads recent unread emails from `INBOX` and ignores `no-reply` senders.
+- **Policy-aware responses**: Uses document retrieval to generate responses based on company policies
 - **Datetime detection**: Parses dates/times from email content and checks calendar availability.
 - **Auto-booking or alternatives**: Books a Calendar event if free; otherwise suggests next available time slots.
 - **Confirmation handling**: Detects confirmation replies and finalizes the meeting.
 - **Urgency analysis**: Uses an LLM to classify emails as `urgent` vs `not urgent`.
-- **Draft generation**: Generates a short professional draft for urgent emails and saves it as a Gmail draft.
+- **Draft generation**: Generates a short professional draft for urgent emails, incorporating policy context when relevant.
 - **Idempotency**: Marks emails with an `ai-processed` label to prevent duplicates.
 - **Slack notifications (optional)**: Posts brief status updates to Slack via webhook.
 
@@ -23,11 +24,13 @@ An automated assistant that triages Gmail messages and coordinates meetings via 
 
 - Python, LangGraph, LangChain OpenAI
 - Google APIs: Gmail, Calendar
+- Document retrieval with semantic search
 - `python-dateutil`, `dotenv`, `requests`
 
 Key files:
 
-- `main_langgraph.py` – full workflow, Gmail/Calendar helpers, and LangGraph nodes
+- `main.py` – Full workflow, Gmail/Calendar helpers, and LangGraph nodes
+- `policies/` – Directory containing policy documents for context-aware responses
 - `requirements.txt` – Python dependencies
 - `credentials.json` – Google OAuth client (you provide)
 - `token.json` – Generated after the first OAuth flow
@@ -102,7 +105,7 @@ Other tweakables:
 
 ## How it works (Workflow)
 
-The workflow is implemented with LangGraph in `create_email_workflow()` using four nodes:
+The workflow is implemented with LangGraph in `create_email_workflow()` using four nodes, with policy-aware response generation:
 
 - `datetime_detection_node(state)`
 
@@ -135,8 +138,16 @@ Conditional edges ensure the graph proceeds only as needed and stops when done.
 From the project root, after activating your venv and setting up `.env` and `credentials.json`:
 
 ```bash
-python main_langgraph.py
+python main.py
 ```
+
+## Policy Documents
+
+The agent can be customized by adding policy documents in the `policies/` directory. These documents will be used to provide context-aware responses. The system will automatically load all `.md` files from this directory and use them to inform its responses.
+
+To add a new policy:
+1. Create a new Markdown (`.md`) file in the `policies/` directory
+2. The system will automatically index it and use it for context in responses
 
 On first run, complete the Google OAuth flow in your browser. The script will then:
 
