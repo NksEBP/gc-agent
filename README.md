@@ -1,31 +1,47 @@
 # GC Agent (Gmail + Calendar LangGraph Assistant)
 
-An automated assistant that triages Gmail messages and coordinates meetings via Google Calendar using a LangGraph workflow and OpenAI. It can:
+An automated assistant that triages Gmail messages and coordinates meetings via Google Calendar using a LangGraph workflow with OpenAI. It features a multi-agent architecture for handling different aspects of email processing:
 
-- Detect meeting requests and book calendar events (or suggest alternatives).
-- Recognize meeting confirmations and send calendar invites.
-- Analyze urgency and create short professional draft replies for urgent emails.
-- Mark processed emails with a custom Gmail label to avoid re-processing.
-- Optionally send Slack notifications when actions are taken.
+- **Calendar Management**: Automatically detects meeting requests, books available slots, or suggests alternatives
+- **Smart Triage**: Analyzes email urgency and content to prioritize responses
+- **Policy-Aware**: Uses document retrieval to generate responses based on company policies
+- **Multi-Agent Workflow**: Dedicated agents for calendar management, confirmation handling, triage, and drafting
+- **Idempotent Processing**: Tracks processed emails to avoid duplicates
 
 ## Features
 
-- **Gmail triage**: Reads recent unread emails from `INBOX` and ignores `no-reply` senders.
-- **Policy-aware responses**: Uses document retrieval to generate responses based on company policies
-- **Datetime detection**: Parses dates/times from email content and checks calendar availability.
-- **Auto-booking or alternatives**: Books a Calendar event if free; otherwise suggests next available time slots.
-- **Confirmation handling**: Detects confirmation replies and finalizes the meeting.
-- **Urgency analysis**: Uses an LLM to classify emails as `urgent` vs `not urgent`.
-- **Draft generation**: Generates a short professional draft for urgent emails, incorporating policy context when relevant.
-- **Idempotency**: Marks emails with an `ai-processed` label to prevent duplicates.
-- **Slack notifications (optional)**: Posts brief status updates to Slack via webhook.
+### Core Functionality
+
+- **Multi-Agent Architecture**: Specialized agents for different tasks (Calendar, Confirmation, Triage, Drafting)
+- **Policy-Aware Responses**: Semantic search over policy documents to inform responses
+- **Smart Email Processing**: Automatically categorizes and processes different types of emails
+
+### Calendar Management
+
+- **Meeting Detection**: Identifies meeting requests in emails
+- **Auto-Booking**: Books available time slots directly to Google Calendar
+- **Smart Suggestions**: Proposes alternative times when requested slots are unavailable
+- **Confirmation Handling**: Recognizes and processes meeting confirmations
+
+### Email Processing
+
+- **Urgency Classification**: LLM-powered classification of email urgency
+- **Draft Generation**: Creates professional draft responses for urgent emails
+- **No-Reply Handling**: Automatically processes and ignores no-reply emails
+- **Duplicate Prevention**: Uses Gmail labels to track processed emails
+
+### Integration & Notifications
+
+- **Google Services**: Seamless integration with Gmail and Google Calendar
+- **Slack Notifications**: Optional real-time updates on actions taken
+- **Logging**: Structured JSON logging for monitoring and debugging
 
 ## Tech Stack
 
-- Python, LangGraph, LangChain OpenAI
-- Google APIs: Gmail, Calendar
-- Document retrieval with semantic search
-- `python-dateutil`, `dotenv`, `requests`
+- **Python 3.10+** with LangGraph for workflow orchestration
+- **OpenAI** for LLM and embeddings
+- **Google APIs** for Gmail and Calendar integration
+- **Key Dependencies**: `python-dateutil`, `requests`, `python-dotenv`, `google-api-python-client`
 
 Key files:
 
@@ -38,100 +54,165 @@ Key files:
 
 ## Prerequisites
 
-- Python 3.10+ recommended
-- A Google Cloud project with OAuth 2.0 Client ID (Desktop) for Gmail + Calendar
-- OpenAI API key (for LLM)
-- Optional: Slack Incoming Webhook URL
+### System Requirements
 
-## Setup
+- Python 3.10 or higher
+- Git (for version control)
+- Google Cloud Platform account
+- OpenAI API key
 
-1. Create and activate a virtual environment
+### Google Cloud Setup
 
-- macOS/Linux
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a project and enable Gmail & Calendar APIs
+3. Configure OAuth consent screen with these scopes:
+   - `.../auth/gmail.readonly`
+   - `.../auth/gmail.compose`
+   - `.../auth/gmail.modify`
+   - `.../auth/calendar`
+4. Create OAuth 2.0 Client ID (Desktop app) and download as `credentials.json`
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+### Environment Setup
 
-- Windows (PowerShell)
+1. Clone the repository:
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
+   ```bash
+   git clone https://github.com/yourusername/gc-agent.git
+   cd gc-agent
+   ```
 
-2. Install dependencies
+2. Create and activate a virtual environment:
 
-```bash
-pip install -r requirements.txt
-```
+   ```bash
+   # macOS/Linux
+   python3 -m venv .venv
+   source .venv/bin/activate
 
-3. Configure environment variables
-   Create a `.env` file in the project root:
+   # Windows
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1
+   ```
 
-```env
-# Required
-OPENAI_API_KEY=sk-...
+3. Install dependencies:
 
-# Optional (Slack notifications)
-ENABLE_SLACK=true
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
-```
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-4. Configure Google OAuth credentials
+4. Configure environment variables:
+   Create a `.env` file in the project root with the following variables:
 
-- In Google Cloud Console, enable APIs:
-  - Gmail API
-  - Google Calendar API
-- Create OAuth Client ID (Application type: Desktop app)
-- Download the JSON and save it as `credentials.json` in the project root
-- On first run, a browser window will open to authorize and will generate `token.json`
+   ```env
+   # Required
+   OPENAI_API_KEY=your_openai_api_key_here
+
+   # Optional: Slack Webhook for notifications
+   ENABLE_SLACK=false
+   SLACK_WEBHOOK_URL=your_slack_webhook_url
+
+   # Optional: Customize model settings
+   # LLM_MODEL=gpt-4-turbo
+   # EMBEDDING_MODEL=text-embedding-3-small
+
+   # Optional: Timezone (fallback if not detected from Google Calendar)
+   # USER_TZ=America/New_York
+   ```
+
+5. First Run:
+   - Make sure `credentials.json` is in the project root
+   - Run the application:
+     ```bash
+     python main.py
+     ```
+   - A browser window will open for Google authentication
+   - After authorization, a `token.json` file will be created
+   - The application is now ready to process emails
 
 ## Configuration
 
-Key configuration constants live in `main_langgraph.py`:
+Key configuration constants live in `main.py`:
 
 - `SCOPES` – Gmail read/compose/modify + Calendar access
 - `LLM_MODEL` – default `gpt-4-turbo` (can be changed)
-- Timezone handling:
-  - `LOCAL_OFFSET` / `LOCAL_TZ` currently set for Nepal (UTC+05:45)
-  - Calendar events use `Asia/Kathmandu`
-  - Adjust these for your locale if needed
+- Timezone handling (automatically detected in this order):
+  1. Uses the timezone from your Google Calendar settings
+  2. Falls back to the `USER_TZ` environment variable if set (e.g., 'America/New_York')
+  3. Defaults to 'Asia/Kathmandu' if neither is available
 
 Other tweakables:
 
 - In `get_emails(...)` you can pass `max_results` to control the Gmail API page size. The current entrypoint calls `get_emails(gmail_service)` without a limit, so it fetches a single page using the API's default page size (no pagination implemented).
 
-## How it works (Workflow)
+## How It Works
 
-The workflow is implemented with LangGraph in `create_email_workflow()` using four nodes, with policy-aware response generation:
+The application uses a multi-agent architecture built with LangGraph, where specialized agents handle different aspects of email processing. The workflow is defined in `create_email_workflow()` and consists of the following agents:
 
-- `datetime_detection_node(state)`
+### 1. Calendar Agent
 
-  - Skips `no-reply` senders
-  - Extracts a datetime from the email body
-  - Checks calendar availability and either:
-    - Books the meeting and sends an AI-crafted confirmation reply, or
-    - Suggests alternative time slots via email
-  - Marks the email as `ai-processed`
+- **Purpose**: Handle meeting-related emails
+- **Key Functions**:
+  - Skips `no-reply` senders automatically
+  - Extracts date/time information using advanced NLP
+  - Checks calendar availability in real-time
+  - For meeting requests:
+    - Books the slot if available
+    - Suggests alternative times if slot is taken
+  - Generates professional, policy-aware responses
+  - Marks emails as processed
 
-- `meeting_confirmation_node(state)`
+### 2. Confirmation Agent
 
-  - Detects confirmation replies (keywords/times)
-  - Creates a calendar event at the confirmed time and replies with confirmation
-  - Marks as `ai-processed`
+- **Purpose**: Process meeting confirmations
+- **Key Functions**:
+  - Detects confirmation patterns in replies
+  - Parses and validates meeting times
+  - Creates calendar events for confirmed meetings
+  - Sends confirmation emails with event details
+  - Handles timezone conversion automatically
 
-- `urgency_analysis_node(state)`
+### 3. Triage Agent
 
-  - Classifies the email as `urgent` or `not urgent` via LLM
-  - Skips if already handled by calendar nodes or `no-reply`
+- **Purpose**: Classify email urgency
+- **Key Functions**:
+  - Uses LLM to analyze email content
+  - Classifies emails as `urgent` or `not urgent`
+  - Considers sender, subject, and content
+  - Skips already processed emails
+  - Passes urgent emails to Draft Agent
 
-- `draft_creation_node(state)`
-  - For urgent emails, generates a short professional draft and saves it in Gmail drafts
-  - Marks as `ai-processed`
+### 4. Draft Agent
 
-Conditional edges ensure the graph proceeds only as needed and stops when done.
+- **Purpose**: Generate draft responses
+- **Key Functions**:
+  - Creates professional, context-aware drafts
+  - Incorporates policy context when relevant
+  - Saves drafts in Gmail (doesn't send automatically)
+  - Handles different response types based on urgency
+  - Marks emails as processed
+
+### Policy Integration
+
+- **RAG Implementation**:
+  - Semantic search over policy documents
+  - Dynamic context injection into responses
+  - Handles policy updates automatically
+  - Caches embeddings for performance
+
+### Workflow Flow
+
+1. Email received → Calendar Agent
+2. If meeting detected → Process meeting request
+3. If confirmation detected → Confirmation Agent
+4. If neither → Triage Agent
+5. If urgent → Draft Agent
+6. Mark as processed
+
+### Error Handling & Logging
+
+- Structured JSON logging
+- Automatic retries for transient failures
+- Detailed error messages
+- Slack notifications for critical actions
 
 ## Running the project
 
@@ -143,11 +224,85 @@ python main.py
 
 ## Policy Documents
 
-The agent can be customized by adding policy documents in the `policies/` directory. These documents will be used to provide context-aware responses. The system will automatically load all `.md` files from this directory and use them to inform its responses.
+The system uses a Retrieval-Augmented Generation (RAG) approach to incorporate policy knowledge into its responses. Policies are stored as Markdown files in the `policies/` directory and are automatically indexed when the application starts.
 
-To add a new policy:
-1. Create a new Markdown (`.md`) file in the `policies/` directory
-2. The system will automatically index it and use it for context in responses
+### Policy Format
+
+Each policy document should be a Markdown (`.md`) file with the following structure:
+
+```markdown
+# Policy Title
+
+## Overview
+
+Brief description of the policy and when it applies
+
+## Guidelines
+
+- Key points or rules
+- Specific instructions
+- Examples of application
+
+## Related Policies
+
+- Links to other related policies (if applicable)
+```
+
+### Best Practices
+
+1. **Be Specific**: Create focused policy documents for different topics
+2. **Use Clear Headings**: Helps with semantic search
+3. **Keep it Concise**: Aim for 1-2 pages per policy
+4. **Use Examples**: Include examples of correct application
+5. **Version Control**: Track changes using Git
+
+### Adding a New Policy
+
+1. Create a new `.md` file in the `policies/` directory
+2. Follow the format above
+3. The system will automatically index the new policy on next run
+
+### Policy Indexing
+
+- Automatic indexing on application start
+- Supports embedding model customization via `EMBEDDING_MODEL` env var
+- Caches embeddings for better performance
+- Handles updates to policy files automatically
+
+### Example Policy
+
+Create a file named `meeting_scheduling.md` in the `policies/` directory:
+
+```markdown
+# Meeting Scheduling Policy
+
+## Overview
+
+Guidelines for scheduling and confirming meetings
+
+## Guidelines
+
+- Always confirm meeting times in the recipient's timezone
+- Include Google Meet links for virtual meetings
+- For external meetings, include:
+  - Meeting purpose
+  - Agenda (if available)
+  - Expected duration
+- Send calendar invites for all confirmed meetings
+
+## Response Templates
+
+- Time proposal: "I'm available on [date] at [time]. Would that work for you?"
+- Confirmation: "I've scheduled our meeting for [date] at [time]. A calendar invite has been sent."
+```
+
+### Troubleshooting
+
+- If policies aren't being detected:
+  - Check file permissions
+  - Ensure files have `.md` extension
+  - Check application logs for indexing errors
+  - Verify the `policies/` directory exists
 
 On first run, complete the Google OAuth flow in your browser. The script will then:
 
@@ -155,31 +310,106 @@ On first run, complete the Google OAuth flow in your browser. The script will th
 - Process each through the workflow
 - Print actions to the console and notify Slack (if enabled)
 
-## Testing tips
+## Testing and Examples
 
-- Send yourself an email with a meeting request like: "Can we meet on August 25 at 4:30 PM?"
-- Reply with confirmations like: "Yes, that works" or "Let's go with the second option" to test confirmation parsing.
-- Try an urgent message to see a draft appear in Gmail drafts.
+### Basic Testing
 
-## Permissions and data
+1. **Meeting Request**
 
-- The app requests Gmail read/compose/modify and Calendar access.
-- Processed emails get a hidden label `ai-processed` for idempotency.
-- The app never replies to `no-reply` style addresses.
+   - Send an email: "Can we meet tomorrow at 2 PM?"
+   - The system will check your calendar and either:
+     - Book the meeting if available
+     - Suggest alternative times if busy
 
-## Troubleshooting
+2. **Meeting Confirmation**
 
-- Missing OpenAI key: ensure `OPENAI_API_KEY` is set in `.env`.
-- Google auth issues: delete `token.json` and re-run to re-auth.
-- Timezone mismatches: adjust `LOCAL_OFFSET`, `LOCAL_TZ`, and the event time zone.
-- Slack not posting: set `ENABLE_SLACK=true` and a valid `SLACK_WEBHOOK_URL`.
-- Package problems: re-run `pip install -r requirements.txt` in your venv.
+   - Reply to a time suggestion: "Yes, 3 PM works for me"
+   - The system will create a calendar event
+   - You'll receive a confirmation email
 
-## Limitations
+3. **Urgent Email**
+   - Send an email with "URGENT" in the subject
+   - Check your Gmail drafts for a response
 
-- Datetime extraction is heuristic and may misinterpret ambiguous text.
-- Only checks/suggests availability from the primary calendar.
-- Currently processes only a single page of unread emails (no pagination across multiple pages).
+### Advanced Testing
+
+#### Test Calendar Integration
+
+```python
+# Example to test calendar availability
+from datetime import datetime, timedelta
+from dateutil.tz import gettz
+
+# Check next week's availability
+start = datetime.now(gettz('America/New_York')) + timedelta(days=7)
+end = start + timedelta(hours=1)
+print(f"Testing availability from {start} to {end}")
+```
+
+#### Test Policy Retrieval
+
+```python
+# Example to test policy search
+from main import retrieve_policy_context
+
+# Search for relevant policies
+policies = retrieve_policy_context("How should we handle meeting rescheduling?")
+for i, policy in enumerate(policies[:3], 1):
+    print(f"\nPolicy {i}:")
+    print(policy['text'][:200] + "...")  # Show first 200 chars
+```
+
+## Permissions and Data Security
+
+### Required Permissions
+
+- **Gmail**: Read, compose, and modify emails
+- **Google Calendar**: View and edit events
+- **Local Storage**: Store OAuth tokens and embeddings cache
+
+### Data Handling
+
+- **Processed Emails**: Marked with `ai-processed` label
+- **No Data Storage**: Emails are processed in memory
+- **Local Cache**: Only ches policy embeddings for performance
+
+## Troubleshooting Guide
+
+### Common Issues
+
+#### Authentication Problems
+
+```bash
+# Re-authenticate by removing token
+rm token.json
+python main.py  # Will prompt for re-authentication
+```
+
+#### Missing Dependencies
+
+```bash
+# Ensure all dependencies are installed
+pip install -r requirements.txt
+
+# If using a virtual environment
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+```
+
+#### Timezone Issues
+
+```bash
+# Check system timezone
+date
+
+# Set timezone in .env
+USER_TZ=America/New_York  # Replace with your timezone
+```
+
+### Logs and Debugging
+
+- Check console output for JSON-formatted logs
+- Enable debug mode: `export LOG_LEVEL=DEBUG`
+- Look for `error` or `warning` level messages
 
 ## License
 
